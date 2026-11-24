@@ -94,8 +94,10 @@ void ChSimpleDriveline::Synchronize(double time, const DriverInputs& driver_inpu
     if (!m_connected)
         return;
 
+    // Treat a torque in the zero band as zero. Do not return early: the driveshaft speed must still be
+    // updated, and the wheel loads must be reset, or the wheels keep the last applied torque.
     if (std::abs(driveshaft_torque) < m_zero_torque)
-        return;
+        driveshaft_torque = 0;
 
     double alpha = GetFrontTorqueFraction();
 
