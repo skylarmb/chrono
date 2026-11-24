@@ -2072,7 +2072,7 @@ void SCMLoader::ComputeInternalForces() {
                 UpdateMeshVertexNormal(ij, iv);       // update vertex normal
         }
 
-        m_trimesh_shape->SetModifiedVertices(modified_vertices);
+        m_trimesh_shape->AddModifiedVertices(modified_vertices);  // accumulate until the renderer consumes them
     }
 
     m_timer_visualization.stop();

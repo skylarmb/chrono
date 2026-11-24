@@ -518,6 +518,30 @@ class CH_VSG_API ChVisualSystemVSG : virtual public ChVisualSystem {
     };
     std::vector<DeformableMesh> m_def_meshes;
 
+    /// A mutable visual mesh split into spatial tiles, each with its own GPU buffers.
+    /// Each frame, only tiles that hold modified vertices (see ChVisualShapeTriangleMesh::GetModifiedVertices) are
+    /// rewritten and transferred, so the cost follows the amount of change, not the mesh size.
+    struct TiledMesh {
+        struct Tile {
+            std::vector<unsigned int> triangles;    ///< parent-mesh triangle indices, in GPU buffer order
+            vsg::ref_ptr<vsg::vec3Array> vertices;  ///< tile vertices (3 per triangle)
+            vsg::ref_ptr<vsg::vec3Array> normals;   ///< tile normals (null if not dynamic)
+            vsg::ref_ptr<vsg::vec4Array> colors;    ///< tile vertex colors (null if not dynamic)
+        };
+        std::shared_ptr<ChVisualShapeTriangleMesh> shape;  ///< visual shape (reports modified vertices)
+        std::vector<Tile> tiles;
+        std::vector<unsigned int> vertex_tile_start;  ///< tiles that use vertex v: vertex_tiles[start[v] .. start[v+1])
+        std::vector<unsigned int> vertex_tiles;
+        std::vector<char> tile_dirty;  ///< scratch: tile needs an update this frame
+    };
+    std::vector<TiledMesh> m_tiled_meshes;
+
+    /// Number of triangles per tile when a mutable visual mesh is split into tiles.
+    static constexpr unsigned int m_triangles_per_tile = 16384;
+
+    /// Rewrite the dirty tiles of a tiled mesh and mark their buffers for transfer.
+    void UpdateTiledMesh(TiledMesh& tmesh);
+
     std::vector<ParticleCloud> m_clouds;                         ///< particle cloud metadata cached for VSG interoperability
     bool m_default_cloud_visibility = true;                      ///< fallback visibility before a specific tag is toggled
     std::unordered_map<int, bool> m_cloud_visibility_overrides;  ///< per-tag visibility overrides

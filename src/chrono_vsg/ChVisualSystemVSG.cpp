@@ -37,6 +37,10 @@ using std::endl;
 namespace chrono {
 namespace vsg3d {
 
+// Helpers for tiled mutable meshes (defined before ChVisualSystemVSG::Update)
+static std::vector<std::vector<unsigned int>> PartitionTriangles(const ChTriangleMeshConnected& mesh, unsigned int per_tile);
+static std::shared_ptr<ChTriangleMeshConnected> ExtractSubmesh(const ChTriangleMeshConnected& mesh, const std::vector<unsigned int>& triangles);
+
 // -----------------------------------------------------------------------------
 
 class ChMainGuiVSG : public vsg::Inherit<vsg::Command, ChMainGuiVSG> {
@@ -1146,6 +1150,10 @@ void ChVisualSystemVSG::Render() {
             }
         }
     }
+
+    // Dynamic data transfer CPU->GPU for tiled (mutable visual) meshes: only tiles with modified vertices
+    for (auto& tmesh : m_tiled_meshes)
+        UpdateTiledMesh(tmesh);
 
     // Dynamic data transfer CPU->GPU for deformable meshes
     // To speed up cpu-gpu - treat ChVector3d arrays as contiguous arrays for bulk conversion over to gpu
@@ -2514,45 +2522,71 @@ void ChVisualSystemVSG::PopulateVisualShapesMutable(vsg::ref_ptr<vsg::Group> gro
 
         bool double_faced = trimesh->IsDoubleFaced();
         bool wireframe = trimesh->IsWireframe();
+        bool has_materials = trimesh->GetNumMaterials() > 0;
 
-        auto transform = vsg::MatrixTransform::create();
-        transform->matrix = vsg::dmat4CH(X_SM, trimesh->GetScale());
-        auto child = trimesh->GetNumMaterials() > 0
-                         ? m_shapeBuilder->CreateTrimeshPbrMatShape(trimesh->GetMesh(), transform, trimesh->GetMaterials(), double_faced, wireframe)
-                         : m_shapeBuilder->CreateTrimeshColShape(trimesh->GetMesh(), transform, trimesh->GetColor(), trimesh->GetOpacity(), double_faced, wireframe);
+        // Split the mesh into tiles. Each tile becomes a separate VSG subgraph with its own buffers,
+        // so a change in one area of the mesh transfers only the tiles that cover that area.
+        TiledMesh tmesh;
+        tmesh.shape = trimesh;
+        const auto& mesh = trimesh->GetMesh();
+        for (auto& triangles : PartitionTriangles(*mesh, m_triangles_per_tile)) {
+            auto submesh = ExtractSubmesh(*mesh, triangles);
 
-        group->addChild(child);
+            auto transform = vsg::MatrixTransform::create();
+            transform->matrix = vsg::dmat4CH(X_SM, trimesh->GetScale());
+            auto child = has_materials ? m_shapeBuilder->CreateTrimeshPbrMatShape(submesh, transform, trimesh->GetMaterials(), double_faced, wireframe)
+                                       : m_shapeBuilder->CreateTrimeshColShape(submesh, transform, trimesh->GetColor(), trimesh->GetOpacity(), double_faced, wireframe);
+            group->addChild(child);
 
-        // Load deformable mesh data (for CPU->GPU transfer)
-
-        DeformableMesh def_mesh;
-        def_mesh.trimesh = trimesh->GetMesh();
-        def_mesh.mesh_soup = true;
-
-        def_mesh.vertices = vsg::visit<FindVec3BufferData<0>>(child).getBufferData();
-        assert(def_mesh.vertices->size() == 3 * trimesh->GetMesh()->GetNumTriangles());
-        def_mesh.vertices->properties.dataVariance = vsg::DYNAMIC_DATA;
-        def_mesh.dynamic_vertices = true;
-
-        if (!trimesh->IsWireframe()) {
-            def_mesh.normals = vsg::visit<FindVec3BufferData<1>>(child).getBufferData();
-            assert(def_mesh.normals->size() == def_mesh.vertices->size());
-            def_mesh.normals->properties.dataVariance = vsg::DYNAMIC_DATA;
-            def_mesh.dynamic_normals = true;
-        } else {
-            def_mesh.dynamic_normals = false;
+            // Find the tile buffers for CPU->GPU transfer (same buffer layout as an untiled mesh soup)
+            TiledMesh::Tile tile;
+            tile.vertices = vsg::visit<FindVec3BufferData<0>>(child).getBufferData();
+            assert(tile.vertices->size() == 3 * triangles.size());
+            tile.vertices->properties.dataVariance = vsg::DYNAMIC_DATA;
+            if (!wireframe) {
+                tile.normals = vsg::visit<FindVec3BufferData<1>>(child).getBufferData();
+                tile.normals->properties.dataVariance = vsg::DYNAMIC_DATA;
+            }
+            if (!has_materials) {
+                tile.colors = vsg::visit<FindVec4BufferData<3>>(child).getBufferData();
+                tile.colors->properties.dataVariance = vsg::DYNAMIC_DATA;
+            }
+            tile.triangles = std::move(triangles);
+            tmesh.tiles.push_back(std::move(tile));
         }
 
-        if (trimesh->GetNumMaterials() == 0) {
-            def_mesh.colors = vsg::visit<FindVec4BufferData<3>>(child).getBufferData();
-            assert(def_mesh.colors->size() == def_mesh.vertices->size());
-            def_mesh.colors->properties.dataVariance = vsg::DYNAMIC_DATA;
-            def_mesh.dynamic_colors = true;
-        } else {
-            def_mesh.dynamic_colors = false;
+        // Map each vertex to the tiles that use it (compressed rows: one count pass, one fill pass)
+        const auto& v_indices = mesh->GetIndicesVertices();
+        size_t nverts = mesh->GetNumVertices();
+        std::vector<int> last_tile(nverts, -1);  // skips repeats of a vertex within one tile
+        tmesh.vertex_tile_start.assign(nverts + 1, 0);
+        for (int pass = 0; pass < 2; pass++) {
+            std::fill(last_tile.begin(), last_tile.end(), -1);
+            std::vector<unsigned int> fill_pos;
+            if (pass == 1) {
+                for (size_t v = 0; v < nverts; v++)
+                    tmesh.vertex_tile_start[v + 1] += tmesh.vertex_tile_start[v];
+                tmesh.vertex_tiles.resize(tmesh.vertex_tile_start[nverts]);
+                fill_pos.assign(tmesh.vertex_tile_start.begin(), tmesh.vertex_tile_start.end() - 1);
+            }
+            for (int it = 0; it < (int)tmesh.tiles.size(); it++) {
+                for (auto tri : tmesh.tiles[it].triangles) {
+                    for (int k = 0; k < 3; k++) {
+                        int v = v_indices[tri][k];
+                        if (last_tile[v] == it)
+                            continue;
+                        last_tile[v] = it;
+                        if (pass == 0)
+                            tmesh.vertex_tile_start[v + 1]++;
+                        else
+                            tmesh.vertex_tiles[fill_pos[v]++] = it;
+                    }
+                }
+            }
         }
+        tmesh.tile_dirty.assign(tmesh.tiles.size(), 1);
 
-        m_def_meshes.push_back(def_mesh);
+        m_tiled_meshes.push_back(std::move(tmesh));
     }
 }
 
@@ -2726,6 +2760,152 @@ void ChVisualSystemVSG::PopulateCollisionShapeMutable(vsg::ref_ptr<vsg::Group> g
 }
 
 // -----------------------------------------------------------------------------
+
+// Group the triangles of a mesh into spatial tiles of about `per_tile` triangles each.
+// Tiles form a regular grid over the two largest extents of the mesh bounding box. Each triangle goes to the tile
+// that contains its centroid. Empty tiles are dropped.
+static std::vector<std::vector<unsigned int>> PartitionTriangles(const ChTriangleMeshConnected& mesh, unsigned int per_tile) {
+    const auto& verts = mesh.GetCoordsVertices();
+    const auto& v_indices = mesh.GetIndicesVertices();
+    unsigned int ntri = (unsigned int)v_indices.size();
+
+    // Tiling axes: the two largest extents of the bounding box
+    ChAABB box;
+    for (const auto& v : verts) {
+        box.min = Vmin(box.min, v);
+        box.max = Vmax(box.max, v);
+    }
+    ChVector3d ext = box.max - box.min;
+    int axes[3] = {0, 1, 2};
+    std::sort(axes, axes + 3, [&](int a, int b) { return ext[a] > ext[b]; });
+    int a0 = axes[0], a1 = axes[1];
+
+    // Grid dimensions: about ntri / per_tile tiles, with cell aspect ratio close to 1
+    double ntiles = std::max(1.0, (double)ntri / per_tile);
+    double e0 = std::max(ext[a0], 1e-9), e1 = std::max(ext[a1], 1e-9);
+    int n0 = std::max(1, (int)std::round(std::sqrt(ntiles * e0 / e1)));
+    int n1 = std::max(1, (int)std::round(ntiles / n0));
+
+    std::vector<std::vector<unsigned int>> grid(n0 * n1);
+    for (unsigned int it = 0; it < ntri; it++) {
+        ChVector3d c = (verts[v_indices[it][0]] + verts[v_indices[it][1]] + verts[v_indices[it][2]]) / 3;
+        int i0 = std::clamp((int)((c[a0] - box.min[a0]) / e0 * n0), 0, n0 - 1);
+        int i1 = std::clamp((int)((c[a1] - box.min[a1]) / e1 * n1), 0, n1 - 1);
+        grid[i0 * n1 + i1].push_back(it);
+    }
+
+    std::vector<std::vector<unsigned int>> tiles;
+    for (auto& cell : grid)
+        if (!cell.empty())
+            tiles.push_back(std::move(cell));
+    return tiles;
+}
+
+// Color of corner k of triangle it, with the same rules as ChTriangleMeshConnected::GetFaceColors().
+static ChColor FaceVertexColor(const ChTriangleMeshConnected& mesh, unsigned int it, int k) {
+    const auto& colors = mesh.GetCoordsColors();
+    const auto& c_indices = mesh.GetIndicesColors();
+    const auto& v_indices = mesh.GetIndicesVertices();
+    if (c_indices.size() == v_indices.size())
+        return colors[c_indices[it][k]];
+    if (c_indices.empty() && colors.size() == mesh.GetNumVertices())
+        return colors[v_indices[it][k]];
+    return ChColor(0.4f, 0.4f, 0.4f);
+}
+
+// Copy the given triangles of a mesh into a new mesh soup (3 separate vertices per triangle), with normals, UVs,
+// colors, and material indices, so that the shape builder produces the same buffers as for the whole mesh.
+static std::shared_ptr<ChTriangleMeshConnected> ExtractSubmesh(const ChTriangleMeshConnected& mesh, const std::vector<unsigned int>& triangles) {
+    const auto& verts = mesh.GetCoordsVertices();
+    const auto& normals = mesh.GetCoordsNormals();
+    const auto& uvs = mesh.GetCoordsUV();
+    const auto& v_indices = mesh.GetIndicesVertices();
+    const auto& n_indices = mesh.GetIndicesNormals();
+    const auto& uv_indices = mesh.GetIndicesUV();
+    const auto& m_indices = mesh.GetIndicesMaterials();
+    size_t ntri = v_indices.size();
+    bool has_normals = n_indices.size() == ntri;
+    bool face_uvs = uv_indices.size() == ntri;
+    bool vertex_uvs = uv_indices.empty() && uvs.size() == verts.size();
+    bool has_materials = m_indices.size() == ntri;
+
+    auto sub = chrono_types::make_shared<ChTriangleMeshConnected>();
+    for (unsigned int it : triangles) {
+        int base = (int)sub->GetCoordsVertices().size();
+        ChVector3i idx(base, base + 1, base + 2);
+        for (int k = 0; k < 3; k++) {
+            sub->GetCoordsVertices().push_back(verts[v_indices[it][k]]);
+            sub->GetCoordsColors().push_back(FaceVertexColor(mesh, it, k));
+            if (has_normals)
+                sub->GetCoordsNormals().push_back(normals[n_indices[it][k]]);
+            if (face_uvs)
+                sub->GetCoordsUV().push_back(uvs[uv_indices[it][k]]);
+            else if (vertex_uvs)
+                sub->GetCoordsUV().push_back(uvs[v_indices[it][k]]);
+        }
+        sub->GetIndicesVertices().push_back(idx);
+        if (has_normals)
+            sub->GetIndicesNormals().push_back(idx);
+        if (has_materials)
+            sub->GetIndicesMaterials().push_back(m_indices[it]);
+    }
+    return sub;
+}
+
+void ChVisualSystemVSG::UpdateTiledMesh(TiledMesh& tmesh) {
+    auto& shape = *tmesh.shape;
+    const auto& mesh = *shape.GetMesh();
+
+    // Find the dirty tiles. If the producer does not report modified vertices, every tile is dirty.
+    if (shape.TracksModifiedVertices()) {
+        size_t nverts = tmesh.vertex_tile_start.size() - 1;
+        for (int v : shape.GetModifiedVertices()) {
+            if ((size_t)v >= nverts)
+                continue;
+            for (auto k = tmesh.vertex_tile_start[v]; k < tmesh.vertex_tile_start[v + 1]; k++)
+                tmesh.tile_dirty[tmesh.vertex_tiles[k]] = 1;
+        }
+        shape.ClearModifiedVertices();  // consumed; the producer accumulates changes for the next frame
+    } else {
+        std::fill(tmesh.tile_dirty.begin(), tmesh.tile_dirty.end(), 1);
+    }
+
+    // Rewrite and transfer the dirty tiles (flat face normals, as for untiled deformable meshes)
+    const auto& verts = mesh.GetCoordsVertices();
+    const auto& v_indices = mesh.GetIndicesVertices();
+    for (size_t t = 0; t < tmesh.tiles.size(); t++) {
+        if (!tmesh.tile_dirty[t])
+            continue;
+        tmesh.tile_dirty[t] = 0;
+        auto& tile = tmesh.tiles[t];
+
+        for (size_t j = 0; j < tile.triangles.size(); j++) {
+            unsigned int it = tile.triangles[j];
+            const auto& p0 = verts[v_indices[it][0]];
+            const auto& p1 = verts[v_indices[it][1]];
+            const auto& p2 = verts[v_indices[it][2]];
+            (*tile.vertices)[3 * j + 0] = vsg::vec3CH(p0);
+            (*tile.vertices)[3 * j + 1] = vsg::vec3CH(p1);
+            (*tile.vertices)[3 * j + 2] = vsg::vec3CH(p2);
+            if (tile.normals) {
+                auto nrm = vsg::vec3CH(Vcross(p1 - p0, p2 - p0).GetNormalized());
+                (*tile.normals)[3 * j + 0] = nrm;
+                (*tile.normals)[3 * j + 1] = nrm;
+                (*tile.normals)[3 * j + 2] = nrm;
+            }
+            if (tile.colors) {
+                for (int k = 0; k < 3; k++)
+                    (*tile.colors)[3 * j + k] = vsg::vec4CH(FaceVertexColor(mesh, it, k));
+            }
+        }
+
+        tile.vertices->dirty();
+        if (tile.normals)
+            tile.normals->dirty();
+        if (tile.colors)
+            tile.colors->dirty();
+    }
+}
 
 void ChVisualSystemVSG::Update() {
     if (m_show_abs_frame) {

@@ -58,8 +58,23 @@ class ChApi ChVisualShapeTriangleMesh : public ChVisualShape {
     bool IsFixedConnectivity() const { return fixed_connectivity; }
     void SetFixedConnectivity() { fixed_connectivity = true; }
 
+    /// Vertices modified since the last call to ClearModifiedVertices() (no duplicates).
+    /// A producer (e.g. SCM terrain) reports changes every step with AddModifiedVertices(). A renderer reads this
+    /// list once per frame, updates only those vertices, then calls ClearModifiedVertices(). The list therefore holds
+    /// all changes made between two frames, however many simulation steps ran in between.
     const std::vector<int>& GetModifiedVertices() const { return modified_vertices; }
-    void SetModifiedVertices(const std::vector<int>& vertices) { modified_vertices = vertices; }
+
+    /// Replace the list of modified vertices.
+    void SetModifiedVertices(const std::vector<int>& vertices);
+
+    /// Add vertices to the list of modified vertices. Vertices already in the list are ignored.
+    void AddModifiedVertices(const std::vector<int>& vertices);
+
+    /// Empty the list of modified vertices.
+    void ClearModifiedVertices();
+
+    /// True once a producer has reported modified vertices. Before that, a renderer must assume all vertices change.
+    bool TracksModifiedVertices() const { return tracks_modified; }
 
     /// Get the shape bounding box.
     virtual ChAABB GetBoundingBox() const override { return trimesh->GetBoundingBox(); }
@@ -81,6 +96,8 @@ class ChApi ChVisualShapeTriangleMesh : public ChVisualShape {
 
     bool fixed_connectivity;
     std::vector<int> modified_vertices;
+    std::vector<char> modified_flags;  ///< per-vertex flag: vertex is in modified_vertices (keeps the list duplicate-free)
+    bool tracks_modified = false;      ///< a producer reports modified vertices
 };
 
 /// @} chrono_assets

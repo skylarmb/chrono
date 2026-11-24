@@ -12,6 +12,7 @@
 // Authors: Alesandro Tasora, Radu Serban
 // =============================================================================
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
 
@@ -31,6 +32,32 @@ ChVisualShapeTriangleMesh::ChVisualShapeTriangleMesh()
 
 ChVisualShapeTriangleMesh::ChVisualShapeTriangleMesh(std::shared_ptr<ChTriangleMeshConnected> mesh, bool load_materials) : ChVisualShapeTriangleMesh() {
     SetMesh(mesh, load_materials);
+}
+
+void ChVisualShapeTriangleMesh::SetModifiedVertices(const std::vector<int>& vertices) {
+    ClearModifiedVertices();
+    AddModifiedVertices(vertices);
+}
+
+void ChVisualShapeTriangleMesh::AddModifiedVertices(const std::vector<int>& vertices) {
+    tracks_modified = true;
+    for (int v : vertices) {
+        if (v < 0)
+            continue;
+        if ((size_t)v >= modified_flags.size())
+            modified_flags.resize(std::max((size_t)v + 1, (size_t)trimesh->GetNumVertices()), 0);
+        if (!modified_flags[v]) {
+            modified_flags[v] = 1;
+            modified_vertices.push_back(v);
+        }
+    }
+}
+
+void ChVisualShapeTriangleMesh::ClearModifiedVertices() {
+    // Reset only the flags that are set, so clearing costs O(modified), not O(mesh size).
+    for (int v : modified_vertices)
+        modified_flags[v] = 0;
+    modified_vertices.clear();
 }
 
 void ChVisualShapeTriangleMesh::SetMesh(std::shared_ptr<ChTriangleMeshConnected> mesh, bool load_materials) {

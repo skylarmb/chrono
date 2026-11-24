@@ -433,6 +433,7 @@ void ChIrrNodeShape::UpdateTriangleMeshFixedConnectivity(std::shared_ptr<ChVisua
                 vertexbuffer[i].Color = tools::ToIrrlichtSColor(colors[i]);
             }
         }
+        trianglemesh->ClearModifiedVertices();  // changes are consumed; the producer accumulates new ones
     }
 
     irrmesh->setDirty();                                         // to force update of hardware buffers
