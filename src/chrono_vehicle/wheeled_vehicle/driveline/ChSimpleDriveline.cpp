@@ -103,8 +103,10 @@ void ChSimpleDriveline::Synchronize(double time, const DriverInputs& driver_inpu
     double speed_front = 0.5 * (m_front_left->GetPosDt() + m_front_right->GetPosDt());
     double speed_rear = 0.5 * (m_rear_left->GetPosDt() + m_rear_right->GetPosDt());
 
-    speed_front *= GetFrontConicalGearRatio();
-    speed_rear *= GetRearConicalGearRatio();
+    // The conical gears reduce speed from the driveshaft to the wheels (wheel = ratio * driveshaft), and the
+    // torques below are divided by the same ratio. Divide the speeds too, so that power is conserved.
+    speed_front /= GetFrontConicalGearRatio();
+    speed_rear /= GetRearConicalGearRatio();
 
     m_driveshaft_speed = alpha * speed_front + (1 - alpha) * speed_rear;
 
