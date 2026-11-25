@@ -69,6 +69,9 @@ class CH_VEHICLE_API ChSolidThreeLinkAxle : public ChSuspension {
     /// Specify whether or not this is an independent suspension.
     virtual bool IsIndependent() const final override { return false; }
 
+    /// Get the body to attach an antiroll bar on the specified side (the axle tube, on both sides).
+    virtual std::shared_ptr<ChBody> GetAntirollBody(VehicleSide side) const override { return m_axleTube; }
+
     /// Construct this suspension subsystem.
     /// The suspension subsystem is initialized by attaching it to the specified chassis and (if provided) to the
     /// specified subchassis, at the specified location (with respect to and expressed in the reference frame of the
